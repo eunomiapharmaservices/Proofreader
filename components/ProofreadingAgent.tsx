@@ -55,9 +55,16 @@ async function extractText(file: File): Promise<string> {
     const zip = await JSZip.loadAsync(file);
     const clean = (xml: string) =>
       xml.replace(/<\/w:p>/g, '\n').replace(/<\/a:p>/g, '\n')
-         .replace(/<[^>]+>/g, ' ')
-         .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
-         .replace(/\s+/g, ' ').replace(/\n +/g, '\n').trim();
+         // Strip tags WITHOUT inserting a space — avoids creating fake gaps
+         // between letters/words that were split across separate <w:r> runs
+         // (e.g. bold/italic formatting mid-word) in the source document.
+         .replace(/<[^>]+>/g, '')
+         .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#x2019;/g, '\u2019').replace(/&#x201[CD];/g, m => m.includes('1C') ? '\u201C' : '\u201D')
+         // Collapse genuine whitespace runs to a single space, but preserve line breaks
+         .replace(/[ \t]+/g, ' ')
+         .replace(/\n +/g, '\n').replace(/ +\n/g, '\n')
+         .replace(/\n{3,}/g, '\n\n')
+         .trim();
     const parts: string[] = [];
 
     if (ext === 'docx') {
@@ -107,6 +114,8 @@ export default function ProofreadingAgent({ user }: { user: User }) {
   const [fileReading, setFileReading] = useState(false);
   const [result, setResult] = useState<CheckResult | null>(null);
   const [feedback, setFeedback] = useState<Record<string, FeedbackState>>({});
+  const [visibleCount, setVisibleCount] = useState(10);
+  const [severityFilter, setSeverityFilter] = useState<'all' | 'error' | 'warning' | 'info'>('all');
 
   const [rules, setRules] = useState<UserRule[]>([]);
   const [prefs, setPrefs] = useState<UserPrefs>({ currency: 'pound', english: 'UK', context: 'pharma', show_suggestions: true });
@@ -208,24 +217,30 @@ Respond ONLY in valid JSON with no markdown fences, no commentary before or afte
   ]
 }
 
-Return at most 8 issues, ordered by severity. Be specific — quote exact text where possible.
+IMPORTANT — accuracy over volume:
+- Only report issues that genuinely exist in the TEXT TO PROOFREAD below. Do not invent or infer issues.
+- The text was extracted from a Word/PDF/PowerPoint file by a script. Extraction can occasionally leave a stray single space where text formatting changed mid-word (e.g. bold ending partway through a word). Do NOT flag isolated single-space gaps inside or between words as a "spacing" or "formatting" error — this is almost always an extraction artifact, not a real document error. Only flag spacing if there are 2+ consecutive spaces, a tab character, or spacing that is clearly wrong in context (e.g. missing space between two sentences).
+- Report every genuine issue you find — there is no need to limit yourself to a small number. List ALL real grammar, currency, typo, and formatting issues present in the text, even if there are 30, 50, or more.
+- Do not pad the list with minor or speculative issues just to reach a number, and do not under-report to keep the list short.
 
-TEXT TO PROOFREAD (first 2500 characters):
+TEXT TO PROOFREAD (first 6000 characters):
 """
-${text.slice(0, 2500)}
+${text.slice(0, 6000)}
 """`;
 
     try {
       const res = await fetch('/api/claude', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 1500, messages: [{ role: 'user', content: prompt }] }),
+        body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 4000, temperature: 0, messages: [{ role: 'user', content: prompt }] }),
       });
       if (!res.ok) throw new Error(`API error ${res.status}`);
       const data = await res.json();
       const raw = (data.content as any[])?.map((c: any) => c.text ?? '').join('') ?? '';
       const parsed: CheckResult = JSON.parse(raw.replace(/```json|```/g, '').trim());
       setResult(parsed);
+      setVisibleCount(10);
+      setSeverityFilter('all');
       await mutateStat('docs');
       addLog(`Checked "${file?.name ?? 'pasted text'}" — ${parsed.issues.length} issue(s) found`);
     } catch (e: any) {
@@ -372,40 +387,74 @@ ${text.slice(0, 2500)}
                   ✓ No issues found — looking good.
                 </div>
               ) : (
-                result.issues.map(issue => {
-                  const fb = feedback[issue.id];
-                  return (
-                    <div key={issue.id}
-                      className={`bg-white rounded-xl px-4 py-4 border border-gray-100 border-l-4 ${severityBorder(issue.severity)}`}>
-                      <div className="flex items-center gap-2 mb-2">
-                        <span className="text-sm">{catIcon[issue.category]}</span>
-                        <span className="text-xs text-gray-400 uppercase tracking-wide">{issue.category}</span>
-                        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${severityBadge(issue.severity)}`}>{issue.severity}</span>
-                      </div>
-                      <p className="text-sm text-gray-800 leading-relaxed mb-2">{issue.description}</p>
-                      <div className="flex flex-wrap gap-3 text-xs text-gray-500">
-                        {issue.original && (
-                          <span>Found: <code className="bg-red-50 text-red-700 px-1.5 py-0.5 rounded font-mono">{issue.original}</code></span>
-                        )}
-                        {issue.suggestion && prefs.show_suggestions && (
-                          <span>Fix: <code className="bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded font-mono">{issue.suggestion}</code></span>
-                        )}
-                      </div>
-                      <div className="flex gap-2 mt-3 flex-wrap">
-                        {([
-                          { action: 'accepted' as FeedbackState, label: `✓ Accept${issue.learnRule ? ' + learn' : ''}`, active: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
-                          { action: 'dismissed' as FeedbackState, label: `Dismiss${issue.ignoreKey ? ' + ignore' : ''}`, active: 'bg-red-50 text-red-600 border-red-200' },
-                          { action: 'snoozed' as FeedbackState, label: 'Skip', active: 'bg-amber-50 text-amber-600 border-amber-200' },
-                        ]).map(({ action, label, active }) => (
-                          <button key={action} onClick={() => giveFeedback(issue, action)}
-                            className={`text-xs px-3 py-1.5 rounded-full border font-medium transition-colors ${fb === action ? active : 'border-gray-200 text-gray-500 hover:border-gray-300 hover:text-gray-700'}`}>
-                            {label}
-                          </button>
-                        ))}
-                      </div>
+                <>
+                  {/* Filter bar + count */}
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <div className="flex gap-1.5">
+                      {([
+                        ['all', `All (${result.issues.length})`],
+                        ['error', `Errors (${result.issues.filter(i => i.severity === 'error').length})`],
+                        ['warning', `Warnings (${result.issues.filter(i => i.severity === 'warning').length})`],
+                        ['info', `Info (${result.issues.filter(i => i.severity === 'info').length})`],
+                      ] as [typeof severityFilter, string][]).map(([key, label]) => (
+                        <button key={key} onClick={() => { setSeverityFilter(key); setVisibleCount(10); }}
+                          className={`text-xs px-3 py-1.5 rounded-full border font-medium transition-colors ${severityFilter === key ? 'bg-blue-50 text-blue-700 border-blue-200' : 'border-gray-200 text-gray-500 hover:border-gray-300'}`}>
+                          {label}
+                        </button>
+                      ))}
                     </div>
-                  );
-                })
+                  </div>
+
+                  {(() => {
+                    const filtered = severityFilter === 'all' ? result.issues : result.issues.filter(i => i.severity === severityFilter);
+                    const visible = filtered.slice(0, visibleCount);
+                    return (
+                      <>
+                        {visible.map(issue => {
+                          const fb = feedback[issue.id];
+                          return (
+                            <div key={issue.id}
+                              className={`bg-white rounded-xl px-4 py-4 border border-gray-100 border-l-4 ${severityBorder(issue.severity)}`}>
+                              <div className="flex items-center gap-2 mb-2">
+                                <span className="text-sm">{catIcon[issue.category]}</span>
+                                <span className="text-xs text-gray-400 uppercase tracking-wide">{issue.category}</span>
+                                <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${severityBadge(issue.severity)}`}>{issue.severity}</span>
+                              </div>
+                              <p className="text-sm text-gray-800 leading-relaxed mb-2">{issue.description}</p>
+                              <div className="flex flex-wrap gap-3 text-xs text-gray-500">
+                                {issue.original && (
+                                  <span>Found: <code className="bg-red-50 text-red-700 px-1.5 py-0.5 rounded font-mono">{issue.original}</code></span>
+                                )}
+                                {issue.suggestion && prefs.show_suggestions && (
+                                  <span>Fix: <code className="bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded font-mono">{issue.suggestion}</code></span>
+                                )}
+                              </div>
+                              <div className="flex gap-2 mt-3 flex-wrap">
+                                {([
+                                  { action: 'accepted' as FeedbackState, label: `✓ Accept${issue.learnRule ? ' + learn' : ''}`, active: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+                                  { action: 'dismissed' as FeedbackState, label: `Dismiss${issue.ignoreKey ? ' + ignore' : ''}`, active: 'bg-red-50 text-red-600 border-red-200' },
+                                  { action: 'snoozed' as FeedbackState, label: 'Skip', active: 'bg-amber-50 text-amber-600 border-amber-200' },
+                                ]).map(({ action, label, active }) => (
+                                  <button key={action} onClick={() => giveFeedback(issue, action)}
+                                    className={`text-xs px-3 py-1.5 rounded-full border font-medium transition-colors ${fb === action ? active : 'border-gray-200 text-gray-500 hover:border-gray-300 hover:text-gray-700'}`}>
+                                    {label}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })}
+
+                        {filtered.length > visible.length && (
+                          <button onClick={() => setVisibleCount(c => c + 10)}
+                            className="w-full text-sm text-blue-600 hover:text-blue-700 font-medium py-3 rounded-xl border border-dashed border-gray-200 hover:border-blue-200 transition-colors">
+                            Show {Math.min(10, filtered.length - visible.length)} more ({visible.length} of {filtered.length} shown)
+                          </button>
+                        )}
+                      </>
+                    );
+                  })()}
+                </>
               )}
             </div>
           )}
